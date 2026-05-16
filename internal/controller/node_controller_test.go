@@ -1007,4 +1007,145 @@ var _ = Describe("Node Controller", func() {
 			Expect(err.Error()).To(ContainSubstring("status patch failed"))
 		})
 	})
+
+	Context("when evaluateRuleForNode returns an error", func() {
+		It("should propagate the error from processNodeAgainstAllRules", func() {
+			ctx := context.Background()
+			testScheme := runtime.NewScheme()
+			Expect(corev1.AddToScheme(testScheme)).To(Succeed())
+			Expect(nodereadinessiov1alpha1.AddToScheme(testScheme)).To(Succeed())
+
+			// Node with unmet condition — will trigger addTaintBySpec which calls Patch.
+			node := &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:   "eval-error-node",
+					Labels: map[string]string{"env": "eval-error"},
+				},
+				Status: corev1.NodeStatus{
+					Conditions: []corev1.NodeCondition{
+						{Type: "Ready", Status: corev1.ConditionFalse},
+					},
+				},
+			}
+
+			rule := &nodereadinessiov1alpha1.NodeReadinessRule{
+				ObjectMeta: metav1.ObjectMeta{Name: "eval-error-rule"},
+				Spec: nodereadinessiov1alpha1.NodeReadinessRuleSpec{
+					Conditions: []nodereadinessiov1alpha1.ConditionRequirement{
+						{Type: "Ready", RequiredStatus: corev1.ConditionTrue},
+					},
+					Taint: corev1.Taint{
+						Key:    "readiness.k8s.io/eval-error",
+						Effect: corev1.TaintEffectNoSchedule,
+					},
+					NodeSelector:    metav1.LabelSelector{MatchLabels: map[string]string{"env": "eval-error"}},
+					EnforcementMode: nodereadinessiov1alpha1.EnforcementModeContinuous,
+				},
+			}
+
+			// Patch interceptor that always returns a non-conflict error so
+			// retry.RetryOnConflict does not retry — addTaintBySpec fails immediately.
+			fc := fakeclient.NewClientBuilder().
+				WithScheme(testScheme).
+				WithObjects(node, rule).
+				WithStatusSubresource(rule).
+				WithInterceptorFuncs(interceptor.Funcs{
+					Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+						return fmt.Errorf("api server unavailable")
+					},
+				}).
+				Build()
+
+			controller := &RuleReadinessController{
+				Client:        fc,
+				Scheme:        testScheme,
+				clientset:     fake.NewSimpleClientset(),
+				ruleCache:     make(map[string]*nodereadinessiov1alpha1.NodeReadinessRule),
+				EventRecorder: record.NewFakeRecorder(10),
+			}
+			controller.updateRuleCache(ctx, rule)
+
+			err := controller.processNodeAgainstAllRules(ctx, node)
+			Expect(err).To(HaveOccurred(), "processNodeAgainstAllRules must propagate evaluateRuleForNode errors")
+			Expect(err.Error()).To(ContainSubstring("api server unavailable"))
+		})
+	})
+
+	Context("when multiple rules fail during node processing", func() {
+		It("should accumulate errors from all failing rules via errors.Join", func() {
+			ctx := context.Background()
+			testScheme := runtime.NewScheme()
+			Expect(corev1.AddToScheme(testScheme)).To(Succeed())
+			Expect(nodereadinessiov1alpha1.AddToScheme(testScheme)).To(Succeed())
+
+			node := &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:   "multi-error-node",
+					Labels: map[string]string{"env": "multi-error"},
+				},
+				Status: corev1.NodeStatus{
+					Conditions: []corev1.NodeCondition{
+						{Type: "Ready", Status: corev1.ConditionFalse},
+					},
+				},
+			}
+
+			rule1 := &nodereadinessiov1alpha1.NodeReadinessRule{
+				ObjectMeta: metav1.ObjectMeta{Name: "multi-error-rule-1"},
+				Spec: nodereadinessiov1alpha1.NodeReadinessRuleSpec{
+					Conditions: []nodereadinessiov1alpha1.ConditionRequirement{
+						{Type: "Ready", RequiredStatus: corev1.ConditionTrue},
+					},
+					Taint: corev1.Taint{
+						Key:    "readiness.k8s.io/multi-error-1",
+						Effect: corev1.TaintEffectNoSchedule,
+					},
+					NodeSelector:    metav1.LabelSelector{MatchLabels: map[string]string{"env": "multi-error"}},
+					EnforcementMode: nodereadinessiov1alpha1.EnforcementModeContinuous,
+				},
+			}
+
+			rule2 := &nodereadinessiov1alpha1.NodeReadinessRule{
+				ObjectMeta: metav1.ObjectMeta{Name: "multi-error-rule-2"},
+				Spec: nodereadinessiov1alpha1.NodeReadinessRuleSpec{
+					Conditions: []nodereadinessiov1alpha1.ConditionRequirement{
+						{Type: "Ready", RequiredStatus: corev1.ConditionTrue},
+					},
+					Taint: corev1.Taint{
+						Key:    "readiness.k8s.io/multi-error-2",
+						Effect: corev1.TaintEffectNoSchedule,
+					},
+					NodeSelector:    metav1.LabelSelector{MatchLabels: map[string]string{"env": "multi-error"}},
+					EnforcementMode: nodereadinessiov1alpha1.EnforcementModeContinuous,
+				},
+			}
+
+			fc := fakeclient.NewClientBuilder().
+				WithScheme(testScheme).
+				WithObjects(node, rule1, rule2).
+				WithStatusSubresource(rule1, rule2).
+				WithInterceptorFuncs(interceptor.Funcs{
+					Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+						return fmt.Errorf("api server unavailable")
+					},
+				}).
+				Build()
+
+			controller := &RuleReadinessController{
+				Client:        fc,
+				Scheme:        testScheme,
+				clientset:     fake.NewSimpleClientset(),
+				ruleCache:     make(map[string]*nodereadinessiov1alpha1.NodeReadinessRule),
+				EventRecorder: record.NewFakeRecorder(10),
+			}
+			controller.updateRuleCache(ctx, rule1)
+			controller.updateRuleCache(ctx, rule2)
+
+			err := controller.processNodeAgainstAllRules(ctx, node)
+			Expect(err).To(HaveOccurred(), "errors from all failing rules must be accumulated")
+			// errors.Join joins individual errors with newlines; the wrapped
+			// message from each rule should appear in the combined error.
+			Expect(err.Error()).To(ContainSubstring("api server unavailable"))
+		})
+	})
 })

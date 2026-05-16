@@ -150,7 +150,6 @@ func (r *RuleReadinessController) processNodeAgainstAllRules(ctx context.Context
 		if err := r.evaluateRuleForNode(ctx, rule, node); err != nil {
 			log.Error(err, "Failed to evaluate rule for node",
 				"node", node.Name, "rule", rule.Name)
-			// Continue with other rules even if one fails
 			r.recordNodeFailure(rule, node.Name, "EvaluationError", err.Error())
 			errs = append(errs, err)
 		}
@@ -215,7 +214,6 @@ func (r *RuleReadinessController) processNodeAgainstAllRules(ctx context.Context
 				"node", node.Name,
 				"rule", rule.Name,
 				"resourceVersion", rule.ResourceVersion)
-			// continue with other rules
 			errs = append(errs, err)
 		} else {
 			log.V(4).Info("Successfully persisted rule status from node reconciler",
