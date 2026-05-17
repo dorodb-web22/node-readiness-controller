@@ -80,9 +80,11 @@ func (w *NodeReadinessRuleWebhook) validateTaintConflicts(ctx context.Context, r
 	// List all existing rules
 	ruleList := &readinessv1alpha1.NodeReadinessRuleList{}
 	if err := w.List(ctx, ruleList); err != nil {
-		// If we can't list rules, allow the operation but log the issue
-		ctrl.Log.Error(err, "Failed to list rules for conflict validation")
-		return allErrs
+		// Fail closed: if we can't list rules, we cannot safely validate
+		// for conflicts. Reject the request so the client can retry.
+		// Use nil path since this is a systemic/infrastructure error,
+		// not an error with any specific field in the user's input.
+		return append(allErrs, field.InternalError(nil, err))
 	}
 
 	taintField := field.NewPath("spec", "taint", "key")
